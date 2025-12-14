@@ -6,8 +6,7 @@ solving a day-ahead battery arbitrage problem using both classical and
 quantum approaches.  The goal is to determine an optimal schedule for
 charging and discharging a battery in response to a deterministic price
 profile and stochastic wind generation scenarios, thereby maximising
-expected revenue.  Much like the VFA-Schrodinger-like-equations project
-for the QHack Open Hackathon, this repository contains source code as
+expected revenue.  This repository contains source code as
 well as Jupyter notebook tutorials explaining how to build, solve and
 analyse the problem.
 
