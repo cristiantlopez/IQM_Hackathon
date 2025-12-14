@@ -15,34 +15,12 @@ order to use this module you need to install pulp (e.g. via
 hourly price information and returns a schedule as a DataFrame together
 with solver status and objective values.
 
-Example
--------
-
-::
-
-    import pandas as pd
-    from main.classical_MILP_solver import ClassicalMILPSolver
-
-    # Load or construct a DataFrame with columns 'hour' and 'price'
-    df = pd.DataFrame({
-        'hour': list(range(1, 25)),
-        'price': [50, 45, 40, 35, 30, 25, 20, 18, 25, 30, 35, 40,
-                  45, 55, 60, 65, 70, 75, 80, 85, 80, 75, 70, 65],
-    })
-
-    # Constant expected wind revenue (can be computed elsewhere)
-    wind_rev_exp = 0.0
-
-    solver = ClassicalMILPSolver(lambda_switch=10.0)
-    schedule, status, battery_profit, total_revenue = solver.solve(df, wind_rev_exp)
-    print(schedule)
-
 """
 
 from __future__ import annotations
 
 import pandas as pd
-from typing import Dict, Iterable, Tuple, List
+from typing import Dict, Iterable, Tuple, List, Optional, Sequence
 
 try:
     import pulp
@@ -92,6 +70,7 @@ class ClassicalMILPSolver:
 
     def __init__(
         self,
+        charge_pattern: Optional[Sequence[int]] = None,
         *,
         Pch: float = 5.0,
         Pdis: float = 4.0,
@@ -110,6 +89,45 @@ class ClassicalMILPSolver:
         self.max_cycles = max_cycles
         self.lambda_switch = lambda_switch
         self.eps = eps
+
+        # Optional warm-start pattern: 0/1 per hour indicating charging (1) or not (0).
+        # If provided, it is used to set initial values for charge[t] and discharge[t]
+        # as well as the mode binaries.
+        self.charge_pattern: Optional[List[int]] = None
+        if charge_pattern is not None:
+            self.set_initial_guess(charge_pattern)
+
+    def set_initial_guess(self, charge_pattern: Sequence[int]) -> None:
+        """Set/replace the warm-start pattern.
+
+        Parameters
+        ----------
+        charge_pattern : Sequence[int]
+            Sequence of 0/1 values indicating whether the battery is charging
+            (1) or not (0) at each hour.
+        """
+        pat = [int(x) for x in charge_pattern]
+        if any(x not in (0, 1) for x in pat):
+            raise ValueError("charge_pattern must contain only 0/1 values")
+        self.charge_pattern = pat
+
+    def _align_charge_pattern(self, hours: List[int]) -> Optional[List[int]]:
+        """Align the stored warm-start pattern to the provided hour index."""
+        if self.charge_pattern is None:
+            return None
+
+        pat = self.charge_pattern
+        if len(pat) == len(hours):
+            return list(pat)
+
+        # Common case: a 24-vector for hours 1..24
+        if len(pat) == 24 and set(hours) == set(range(1, 25)):
+            return [pat[t - 1] for t in hours]
+
+        raise ValueError(
+            f"charge_pattern length ({len(pat)}) does not match number of hours ({len(hours)}), "
+            "and could not be aligned to hours 1..24."
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -219,8 +237,79 @@ class ClassicalMILPSolver:
         start_penalty = self.lambda_switch * pulp.lpSum(start_ch[t] + start_dis[t] for t in hours)
         model += battery_revenue + wind_rev_exp - start_penalty
 
-        # Solve the model using the default CBC solver; suppress solver output
-        model.solve(pulp.PULP_CBC_CMD(msg=0))
+        # -----------------------
+        # Warm start (optional)
+        # -----------------------
+        # The user can pass a 0/1 vector at construction time indicating whether we
+        # are charging (1) or not (0). We use it as an initial guess for:
+        #   - charge[t]  (continuous)  -> guess in {0,1}
+        #   - discharge[t]            -> 1 - charge_guess
+        #   - mode binaries u_ch/u_dis (and u_id=0)
+        # and derive consistent start_* initial values.
+        aligned_pat = self._align_charge_pattern(hours)
+        if aligned_pat is not None:
+            try:
+                soc_guess = 0.0
+                soc[0].setInitialValue(0.0)
+                prev_ch = 0
+                prev_dis = 0
+
+                for i, t in enumerate(hours):
+                    ch_on = int(aligned_pat[i])
+                    dis_on = 1 - ch_on
+
+                    # Mode binaries (idle initialised to 0 per requested pattern)
+                    u_ch[t].setInitialValue(ch_on)
+                    u_dis[t].setInitialValue(dis_on)
+                    u_id[t].setInitialValue(0)
+
+                    # Continuous initial guesses (per request)
+                    c0 = float(ch_on)
+                    d0 = float(dis_on)  # == 1 - c0
+
+                    # Keep the warm start numerically reasonable and avoid negative SOC.
+                    # (CBC may ignore infeasible MIP starts; this improves acceptance.)
+                    max_d_from_soc = (soc_guess + self.eta_ch * c0) * self.eta_dis
+                    if d0 > max_d_from_soc:
+                        d0 = max(0.0, max_d_from_soc)
+
+                    c0 = min(c0, self.Pch)
+                    d0 = min(d0, self.Pdis)
+
+                    charge[t].setInitialValue(c0)
+                    discharge[t].setInitialValue(d0)
+
+                    soc_guess = soc_guess + self.eta_ch * c0 - (1.0 / self.eta_dis) * d0
+                    soc_guess = max(0.0, min(self.Emax, soc_guess))
+                    soc[t].setInitialValue(soc_guess)
+
+                    # Start variables derived from mode binaries
+                    if i == 0:
+                        start_ch[t].setInitialValue(ch_on)
+                        start_dis[t].setInitialValue(dis_on)
+                    else:
+                        start_ch[t].setInitialValue(1 if (ch_on == 1 and prev_ch == 0) else 0)
+                        start_dis[t].setInitialValue(1 if (dis_on == 1 and prev_dis == 0) else 0)
+
+                    prev_ch, prev_dis = ch_on, dis_on
+            except Exception:
+                # If the backend does not support initial values, or if anything goes
+                # wrong, we simply proceed without a warm start.
+                aligned_pat = None
+
+        # Solve the model using the default CBC solver; suppress solver output.
+        # If available, enable CBC warm-starting when we set initial values.
+        solver_kwargs = {"msg": 0}
+        if aligned_pat is not None:
+            try:
+                import inspect
+
+                if "warmStart" in inspect.signature(pulp.PULP_CBC_CMD.__init__).parameters:
+                    solver_kwargs["warmStart"] = True
+            except Exception:
+                pass
+
+        model.solve(pulp.PULP_CBC_CMD(**solver_kwargs))
         status = pulp.LpStatus.get(model.status, str(model.status))
         battery_profit = float(pulp.value(battery_revenue)) if pulp.value(battery_revenue) is not None else float("nan")
         total_revenue = float(pulp.value(model.objective)) if pulp.value(model.objective) is not None else float("nan")
@@ -241,3 +330,87 @@ class ClassicalMILPSolver:
         schedule["start_discharge_block"] = [start_dis[t].value() for t in hours]
 
         return schedule, status, battery_profit, total_revenue
+
+    def plot_battery_schedule(
+        self,
+        schedule: pd.DataFrame,
+        Emax: float | None = None,
+        figsize: tuple[float, float] = (12, 8),
+        show: bool = True,
+    ):
+        """Plot battery dispatch (charge/discharge) and SOC trajectory.
+
+        Parameters
+        ----------
+        schedule : pandas.DataFrame
+            Output schedule produced by :meth:`solve`. Must contain the columns
+            ``hour``, ``charge_MWh``, ``discharge_MWh`` and ``soc_MWh``.
+        Emax : float, optional
+            Battery capacity for setting y-limits on the SOC plot. If omitted,
+            uses the solver's configured ``self.Emax``.
+        figsize : tuple, optional
+            Figure size (default (12, 8)).
+        show : bool, optional
+            If True (default), calls ``plt.show()``.
+
+        Returns
+        -------
+        (fig, (ax1, ax2))
+            The matplotlib figure and axes handles.
+        """
+        required = {"hour", "charge_MWh", "discharge_MWh", "soc_MWh"}
+        missing = required.difference(schedule.columns)
+        if missing:
+            raise ValueError(
+                "schedule is missing required columns: " + ", ".join(sorted(missing))
+            )
+
+        # Import matplotlib lazily so the solver can be imported in headless
+        # environments without plotting dependencies.
+        import matplotlib.pyplot as plt
+
+        Emax_plot = self.Emax if Emax is None else float(Emax)
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+
+        # Dispatch bars: charge is plotted negative, discharge positive
+        ax1.bar(
+            schedule["hour"],
+            -schedule["charge_MWh"],
+            width=0.8,
+            color="#1f77b4",
+            alpha=0.7,
+            label="Charge (MWh, negative)",
+        )
+        ax1.bar(
+            schedule["hour"],
+            schedule["discharge_MWh"],
+            width=0.8,
+            color="#ff7f0e",
+            alpha=0.7,
+            label="Discharge (MWh)",
+        )
+        ax1.axhline(0, color="black", linewidth=1)
+        ax1.set_ylabel("Energy per hour (MWh)")
+        ax1.legend(loc="upper left")
+        ax1.set_title("Battery dispatch")
+
+        # SOC trajectory
+        ax2.step(
+            schedule["hour"],
+            schedule["soc_MWh"],
+            where="mid",
+            linewidth=3,
+            color="#2ca02c",
+        )
+        ax2.set_ylabel("State of charge (MWh)")
+        ax2.set_xlabel("Hour")
+        ax2.set_ylim(0, Emax_plot + 1)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_title("SOC trajectory")
+
+        plt.tight_layout()
+        if show:
+            plt.show()
+
+        return fig, (ax1, ax2)
